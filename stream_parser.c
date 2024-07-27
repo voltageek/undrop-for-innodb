@@ -28,6 +28,32 @@
 #endif
 
 #include "mysql_def.h"
+#include "zlib/zlib.h"
+
+#define BUF_NO_CHECKSUM_MAGIC 0xDEADBEEFU
+#define FIL_PAGE_COMP_METADATA_LEN	2
+#define FIL_PAGE_COMP_SIZE 	0
+
+#define UNIV_PAGE_SIZE_SHIFT_MAX	16U
+#define UNIV_PAGE_SIZE_MAX	(1U << UNIV_PAGE_SIZE_SHIFT_MAX)
+#define PAGE_UNCOMPRESSED	0
+#define PAGE_ZLIB_ALGORITHM	1
+#define PAGE_LZ4_ALGORITHM	2
+#define PAGE_LZO_ALGORITHM	3
+#define PAGE_LZMA_ALGORITHM	4
+#define PAGE_BZIP2_ALGORITHM	5
+#define PAGE_SNAPPY_ALGORITHM	6
+// #define STREAM_PARSER_DEBUG
+
+uint64_t mach_read_from_6(page_t* b){
+    uint32_t high;
+    uint32_t low;
+
+    high = mach_read_from_2(b);
+    low = mach_read_from_4(b + 2);
+    return ((uint64_t)high << 32) + (uint64_t)low;
+}
+
 
 // Global flags from getopt
 #ifdef STREAM_PARSER_DEBUG
@@ -41,7 +67,7 @@ int use_filter_id = 0;
 
 ssize_t cache_size = 8*1024*1024; // 8M
 off_t ib_size = 0;
-uint32_t max_page_id = 0;
+uint64_t max_page_id = 0;
 char dst_dir[1024] = "";
 int worker = 0;
 #define  mutext_pool_size (8)
@@ -55,7 +81,6 @@ sem_t blob_mutex[mutext_pool_size];
 
 void usage(char*);
 
-#ifdef STREAM_PARSER_DEBUG
 int DEBUG_LOG(char* format, ...){
     if(debug){
         char msg[1024] = "";
@@ -68,7 +93,6 @@ int DEBUG_LOG(char* format, ...){
         }
     return 0;
 }
-#endif
 
 void error(char *msg) {
     fprintf(stderr, "Error: %s\n", msg);
@@ -91,6 +115,49 @@ char* h_size(unsigned long long int size, char* buf){
         default: sprintf(buf, "%s exp(+%u)", buf, power); break;
         }
     return buf;
+}
+
+uint64_t fil_page_decompress(
+	page_t*	tmp_buf,
+	page_t*	buf)
+{
+	uint header_len;
+	uint comp_algo;
+
+	header_len = FIL_PAGE_DATA + FIL_PAGE_COMP_METADATA_LEN;
+	if (mach_read_from_6(FIL_PAGE_FILE_FLUSH_LSN + buf)) {
+		return 0;
+	}
+	comp_algo = mach_read_from_2(FIL_PAGE_FILE_FLUSH_LSN + 6 + buf);
+
+	if (mach_read_from_4(buf + FIL_PAGE_SPACE_OR_CHKSUM)
+	    != BUF_NO_CHECKSUM_MAGIC) {
+		return 0;
+	}
+
+	uint64_t actual_size = mach_read_from_2(buf + FIL_PAGE_DATA
+					     + FIL_PAGE_COMP_SIZE);
+
+	if (actual_size == 0 || actual_size > cache_size - header_len) {
+		return 0;
+	}
+
+	switch(comp_algo) {
+          case PAGE_ZLIB_ALGORITHM: {
+            ssize_t len = UNIV_PAGE_SIZE;
+            int result = R_OK == uncompress(tmp_buf, &len, buf + header_len, actual_size);
+            if (!(result && len == UNIV_PAGE_SIZE)) {
+              return 0;
+            }
+
+	    memcpy(buf, tmp_buf, UNIV_PAGE_SIZE);
+            return actual_size;
+          }
+          default: {
+            fprintf(stderr, "Unsupported page compression algorithm %i\n", comp_algo);
+            return 0;
+          }
+        }
 }
 
 inline int valid_innodb_checksum(page_t* p){
@@ -134,7 +201,7 @@ valid_innodb_checksum_exit:
     return result;
     }
 
-inline int valid_blob_page(page_t* page){
+inline int  valid_blob_page(page_t* page){
     uint16_t page_type = mach_read_from_2(page + FIL_PAGE_TYPE);
     uint32_t page_id = mach_read_from_4(page + FIL_PAGE_OFFSET);
 #ifdef STREAM_PARSER_DEBUG
@@ -174,6 +241,62 @@ inline int valid_blob_page(page_t* page){
     return valid_innodb_checksum(page);
 
 }
+
+inline int valid_mysql_compressed_page(page_t* page){
+    uint16_t page_type = mach_read_from_2(page + FIL_PAGE_TYPE);
+    uint32_t page_id = mach_read_from_4(page + FIL_PAGE_OFFSET);
+#ifdef STREAM_PARSER_DEBUG
+    DEBUG_LOG("Checking page id = %u", page_id);
+#endif
+
+    if(page_type != 14){
+#ifdef STREAM_PARSER_DEBUG
+        DEBUG_LOG("Wrong page type = %u", page_type);
+#endif
+        return 0;
+        }
+    // TODO: incomplete support for mysql compressed page, but just assume its correct to count it
+return 1; 
+}
+
+inline int valid_mariadb_compressed_page(page_t* page, uint64_t block_size, page_t* tmp_page){
+    uint16_t page_type = mach_read_from_2(page + FIL_PAGE_TYPE);
+    uint32_t page_id = mach_read_from_4(page + FIL_PAGE_OFFSET);
+
+#ifdef STREAM_PARSER_DEBUG
+    DEBUG_LOG("Checking page id = %u", page_id);
+#endif
+
+    if(page_type != 34354){
+#ifdef STREAM_PARSER_DEBUG
+        DEBUG_LOG("Wrong page type = %u", page_type);
+#endif
+        return 0;
+        }
+    
+    uint16_t compression_format = mach_read_from_8(page + FIL_PAGE_FILE_FLUSH_LSN);
+
+    page_t *tmp_frame = NULL;
+    tmp_frame = malloc(UNIV_PAGE_SIZE_MAX);
+
+    memcpy(tmp_page, page, UNIV_PAGE_SIZE_MAX);
+
+    uint64_t decomp = fil_page_decompress(tmp_frame, tmp_page);
+    if (!decomp) {
+#ifdef STREAM_PARSER_DEBUG
+        DEBUG_LOG("Page decompression failed");
+#endif
+	return 0;
+    }
+    off_t cache_step = 1;
+
+    int is_valid_innodb_page = valid_innodb_page(tmp_page, block_size, &cache_step);
+#ifdef STREAM_PARSER_DEBUG
+    DEBUG_LOG("Page decompression %i result valid, %i checksum", is_valid_innodb_page, valid_innodb_checksum(tmp_page));
+#endif
+    return is_valid_innodb_page;
+}
+
 inline int valid_innodb_page(page_t* page, uint64_t block_size, off_t* step){
     int version = 0; // 1 - new, 0 - old
     unsigned int page_n_heap;
@@ -241,10 +364,18 @@ inline int valid_innodb_page(page_t* page, uint64_t block_size, off_t* step){
     DEBUG_LOG("\tVersion: %s", (version == 1)? "COMPACT" : "REDUNDANT");
 #endif
     if(version == 1){
+#ifdef STREAM_PARSER_DEBUG
+        DEBUG_LOG("\tPAGE_NEW_INFIMUM: %lu", PAGE_NEW_INFIMUM);
+        DEBUG_LOG("\tPAGE_NEW_SUPREMUM: %lu", PAGE_NEW_SUPREMUM);
+#endif
         inf_offset = PAGE_NEW_INFIMUM;
         sup_offset = PAGE_NEW_SUPREMUM;
         }
     else{
+#ifdef STREAM_PARSER_DEBUG
+        DEBUG_LOG("\tPAGE_OLD_INFIMUM: %lu", PAGE_OLD_INFIMUM);
+        DEBUG_LOG("\tPAGE_OLD_SUPREMUM: %lu", PAGE_OLD_SUPREMUM);
+#endif
         inf_offset = PAGE_OLD_INFIMUM;
         sup_offset = PAGE_OLD_SUPREMUM;
         }
@@ -393,6 +524,14 @@ void process_ibfile(int fn, off_t start_offset, ssize_t length){
     // off_t prev_disk_offset = 0;
     off_t global_offset = 0;
 
+    page_t *decompressed_page = NULL;
+    decompressed_page = malloc(UNIV_PAGE_SIZE_MAX);
+    int valid_blob_pages = 0;
+    int valid_innodb_pages = 0; 
+    int mysql_compressed_pages = 0;
+    int mariadb_compressed_pages = 0;
+    int invalid_pages = 0;
+
     if (!cache){
         char tmp[20];
         fprintf(stderr, "Can't allocate memory (%s) for disk cache\n", h_size(cache_size, tmp));
@@ -433,13 +572,33 @@ void process_ibfile(int fn, off_t start_offset, ssize_t length){
 #ifdef STREAM_PARSER_DEBUG
             DEBUG_LOG("Checking page at cache offset %lu. Global offset %lu", curr_cache_offset, global_offset);
 #endif
-            if (
-                    valid_blob_page(cache + curr_cache_offset) ||
-                    valid_innodb_page(cache + curr_cache_offset, bytes_in_cache - curr_cache_offset, &cache_step)
-                    )
+
+            int is_valid_blob_page = valid_blob_page(cache + curr_cache_offset);
+            int is_valid_innodb_page = !is_valid_blob_page && valid_innodb_page(cache + curr_cache_offset, bytes_in_cache - curr_cache_offset, &cache_step);
+            int is_valid_mysql_compressed_page = !is_valid_blob_page && !is_valid_innodb_page && valid_mysql_compressed_page(cache + curr_cache_offset);
+            int is_valid_mariadb_compressed_page = !is_valid_blob_page && !is_valid_innodb_page && !is_valid_mysql_compressed_page && valid_mariadb_compressed_page(cache + curr_cache_offset, bytes_in_cache - curr_cache_offset, decompressed_page);
+            if (is_valid_blob_page || is_valid_innodb_page)
             {
+                DEBUG_LOG("Valid Blob/InnoDB page found...");
+                if (is_valid_blob_page) valid_blob_pages++;
+                if (is_valid_innodb_page) valid_innodb_pages++;
                 process_ibpage(cache + curr_cache_offset);
                 cache_step = UNIV_PAGE_SIZE;
+	    }
+           else if (is_valid_mariadb_compressed_page) {
+                DEBUG_LOG("Valid Compressed MariaDB page found...");
+                mariadb_compressed_pages++;
+                process_ibpage(decompressed_page);
+                cache_step = UNIV_PAGE_SIZE;
+           }
+           else {
+              if (is_valid_mysql_compressed_page) {
+                mysql_compressed_pages++;
+              }
+              else {
+                DEBUG_LOG("Invalid page found...");
+                invalid_pages++;
+              } 
             }
 #ifdef STREAM_PARSER_DEBUG
             DEBUG_LOG("Moving cache pointer %lu bytes", cache_step);
@@ -481,6 +640,7 @@ void process_ibfile(int fn, off_t start_offset, ssize_t length){
         DEBUG_LOG("Disk offset at the end of read cycle %llu", curr_disk_offset);
 #endif
         }
+         fprintf(stderr, "Stream contained %i blob, %i innodb, %i mysql compressed, %i mariadb compressed and %i ignored page read attempts\n", valid_blob_pages, valid_innodb_pages, mysql_compressed_pages, mariadb_compressed_pages, invalid_pages);
     return;
 }
 
@@ -558,7 +718,8 @@ int open_ibfile(char *fname){
 #else
     fprintf(stderr, "Size to process:              %12lu (%s)\n", ib_size, h_size(ib_size, buf));
 #endif
-    max_page_id = ib_size/UNIV_PAGE_SIZE;
+    //max_page_id = ib_size/UNIV_PAGE_SIZE;
+    max_page_id = 9000000000;
 
     return fn;
 }

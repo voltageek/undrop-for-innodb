@@ -80,6 +80,7 @@ bool debug = 0;
 //bool process_redundant = 0;
 //bool process_compact = 0;
 bool process_56 = 0;
+bool output_sql_inserts = 0;
 char blob_dir[256] = ".";
 char dump_prefix[256] = "default";
 char path_ibdata[256];
@@ -138,27 +139,30 @@ ut_print_buf(
 ulint process_ibrec(page_t *page, rec_t *rec, table_def_t *table, ulint *offsets, bool hex) {
 	ulint data_size;
 	int i;
-	// Print trx_id and rollback pointer
-	for(i = 0; i < table->fields_count; i++) {
-		ulint len;
-		byte *field = rec_get_nth_field(rec, offsets, i, &len);
-
-		if (table->fields[i].type == FT_INTERNAL){
-			if (debug) printf("Field #%i @ %p: length %lu, value: ", i, field, len);
-			print_field_value(field, len, &(table->fields[i]), hex);
-			if (i < table->fields_count - 1) fprintf(f_result, "\t");
-			if (debug) printf("\n");
+        if (!output_sql_inserts) { 
+    		// Print trx_id and rollback pointer
+	    	for(i = 0; i < table->fields_count; i++) {
+    			ulint len;
+    			byte *field = rec_get_nth_field(rec, offsets, i, &len);
+	    
+		    	if (table->fields[i].type == FT_INTERNAL){
+	    			if (debug) printf("Field #%i @ %p: length %lu, value: ", i, field, len);
+	    			print_field_value(field, len, &(table->fields[i]), hex);
+		    		if (i < table->fields_count - 1) fprintf(f_result, "\t");
+		    		if (debug) printf("\n");
 			}
-	}
+		}
+        }
 
 	// Print table name
 	if (debug) {
 		printf("Processing record %p from table '%s'\n", rec, table->name);
 		rec_print_new(stdout, rec, offsets);
+	} else if (output_sql_inserts) {
+		fprintf(f_result, "INSERT INTO `%s` VALUES(", table->name);
 	} else {
 		fprintf(f_result, "%s\t", table->name);
 	}
-
 	data_size = rec_offs_data_size(offsets);
 
 	for(i = 0; i < table->fields_count; i++) {
@@ -179,9 +183,14 @@ ulint process_ibrec(page_t *page, rec_t *rec, table_def_t *table, ulint *offsets
                     }
 		    }
 
-		if (i < table->fields_count - 1) fprintf(f_result, "\t");
+		if (i < table->fields_count - 1) {
+		        if (output_sql_inserts)	fprintf(f_result, ",");
+		        else fprintf(f_result, "\t");
+		}
 		if (debug) printf("\n");
 	}
+        if (output_sql_inserts)
+		fprintf(f_result, ");");
 	fprintf(f_result, "\n");
 	return data_size; // point to the next possible record's start
 }
@@ -767,6 +776,7 @@ void usage() {
 	  "    -i <file> -- Read external pages at their offsets from <file>.\n"
 	  "    -p prefix -- Use prefix for a directory name in LOAD DATA INFILE command\n"
 	  "    -x -- Print text values in hexadecimal format.\n"
+	  "    -s -- Output format as Insert statements.\n"
 	  "\n"
 	);
 }
@@ -788,7 +798,7 @@ int main(int argc, char **argv) {
 	char sql_file[1024];
 	bool hex = 0;
 
-	while ((ch = getopt(argc, argv, "t:456hdDUVf:T:b:p:o:i:l:x")) != -1) {
+	while ((ch = getopt(argc, argv, "t:456hdDUVf:T:b:p:o:i:l:x:s")) != -1) {
 		switch (ch) {
 			case 'd':
 				deleted_pages_only = 1;
@@ -842,6 +852,9 @@ int main(int argc, char **argv) {
                 break;
             case '6':
                 process_56 = 1;
+                break;
+            case 's':
+                output_sql_inserts = 1;
                 break;
             case 'T':
                 set_filter_id(optarg);

@@ -35,19 +35,29 @@
 					to the last 4 bytes of FIL_PAGE_LSN */
 #define FIL_PAGE_DATA_END	8
 
-/* File page types */
-#define FIL_PAGE_INDEX		17855
-#define FIL_PAGE_UNDO_LOG	2
-#define FIL_PAGE_INODE		3
-#define FIL_PAGE_IBUF_FREE_LIST	4
+/** File page types (values of FIL_PAGE_TYPE) @{ */
+#define FIL_PAGE_PAGE_COMPRESSED_ENCRYPTED 37401 /*!< Page is compressed and
+						 then encrypted */
+#define FIL_PAGE_PAGE_COMPRESSED 34354  /*!< page compressed page */
+#define FIL_PAGE_INDEX		17855	/*!< B-tree node */
+#define FIL_PAGE_RTREE		17854	/*!< R-tree node (SPATIAL INDEX) */
+#define FIL_PAGE_UNDO_LOG	2	/*!< Undo log page */
+#define FIL_PAGE_INODE		3	/*!< Index node */
+#define FIL_PAGE_IBUF_FREE_LIST	4	/*!< Insert buffer free list */
 /* File page types introduced in MySQL/InnoDB 5.1.7 */
-#define FIL_PAGE_TYPE_ALLOCATED 0   /* Freshly allocated page */
-#define FIL_PAGE_IBUF_BITMAP    5   /* Insert buffer bitmap */
-#define FIL_PAGE_TYPE_SYS   6   /* System page */
-#define FIL_PAGE_TYPE_TRX_SYS   7   /* Transaction system data */
-#define FIL_PAGE_TYPE_FSP_HDR   8   /* File space header */
-#define FIL_PAGE_TYPE_XDES  9   /* Extent descriptor page */
-#define FIL_PAGE_TYPE_BLOB  10  /* Uncompressed BLOB page */
+#define FIL_PAGE_TYPE_ALLOCATED	0	/*!< Freshly allocated page */
+#define FIL_PAGE_IBUF_BITMAP	5	/*!< Insert buffer bitmap */
+#define FIL_PAGE_TYPE_SYS	6	/*!< System page */
+#define FIL_PAGE_TYPE_TRX_SYS	7	/*!< Transaction system data */
+#define FIL_PAGE_TYPE_FSP_HDR	8	/*!< File space header */
+#define FIL_PAGE_TYPE_XDES	9	/*!< Extent descriptor page */
+#define FIL_PAGE_TYPE_BLOB	10	/*!< Uncompressed BLOB page */
+#define FIL_PAGE_TYPE_ZBLOB	11	/*!< First compressed BLOB page */
+#define FIL_PAGE_TYPE_ZBLOB2	12	/*!< Subsequent compressed BLOB page */
+#define FIL_PAGE_TYPE_UNKNOWN	13	/*!< In old tablespaces, garbage
+					in FIL_PAGE_TYPE is replaced with this
+					value when flushing pages. */
+#define FIL_PAGE_TYPE_INSTANT	18
 
 #define	PAGE_HEADER	FSEG_PAGE_DATA	/* index page header starts at this
 				offset */

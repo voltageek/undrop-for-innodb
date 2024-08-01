@@ -414,89 +414,137 @@ inline void print_field_value(byte *value, ulint len, field_def_t *field, bool h
 
 /*******************************************************************/
 void print_field_value_with_external(byte *value, ulint len, field_def_t *field, bool hex) {
-   ulint   page_no, offset, extern_len, len_sum;
-   char tmp[256];
-   page_t *page = ut_align(buffer, UNIV_PAGE_SIZE);
+    ulint page_no, offset, extern_len, len_sum;
+    char tmp[256];
+    page_t *page = ut_align(buffer, UNIV_PAGE_SIZE);
+    int fn = -1;
+    bool blob_error = 0;
 
-   switch (field->type) {
-       case FT_TEXT:
-       case FT_BLOB:
-           page_no = mach_read_from_4(value + len - BTR_EXTERN_FIELD_REF_SIZE + BTR_EXTERN_PAGE_NO);
-           offset = mach_read_from_4(value + len - BTR_EXTERN_FIELD_REF_SIZE + BTR_EXTERN_OFFSET);
-           extern_len = mach_read_from_4(value + len - BTR_EXTERN_FIELD_REF_SIZE + BTR_EXTERN_LEN + 4);
-           len_sum = 0;
+    if (!value || !field) {
+        fprintf(f_result, "<NULL_ERROR>");
+        return;
+    }
 
-           if (field->type == FT_TEXT && !hex) {
-               fprintf(f_result, "\"");
-               print_string_raw((char*)value, len - BTR_EXTERN_FIELD_REF_SIZE);
-           } else {
-               print_hex((char*)value, len - BTR_EXTERN_FIELD_REF_SIZE);
-           }
+    switch (field->type) {
+    case FT_TEXT:
+    case FT_BLOB:
+        if (len < BTR_EXTERN_FIELD_REF_SIZE) {
+            fprintf(f_result, "<INVALID_BLOB_REF>");
+            return;
+        }
 
-           for (;;) {
-               byte*   blob_header;
-               ulint   part_len;
+        page_no = mach_read_from_4(value + len - BTR_EXTERN_FIELD_REF_SIZE + BTR_EXTERN_PAGE_NO);
+        offset = mach_read_from_4(value + len - BTR_EXTERN_FIELD_REF_SIZE + BTR_EXTERN_OFFSET);
+        extern_len = mach_read_from_4(value + len - BTR_EXTERN_FIELD_REF_SIZE + BTR_EXTERN_LEN + 4);
+        len_sum = 0;
 
-               sprintf(tmp, "%s/%016lu.page", blob_dir, page_no);
-                if(external_in_ibdata){
-                    if(fn == 0) { 
-                        fn = open(path_ibdata, O_RDONLY);
-                        if(fn == -1){
-                            fprintf(stderr, "-- #####CannotOpen_%s;\n", path_ibdata);
-                            perror("-- print_field_value_with_external(): open()");
-                            break;
-                        }
+        fprintf(stderr, "DEBUG: Initial BLOB info - Page: %lu, Offset: %lu, Extern Len: %lu\n", page_no, offset, extern_len);
+
+        if (field->type == FT_TEXT && !hex) {
+            fprintf(f_result, "\"");
+            print_string_raw((char*)value, len - BTR_EXTERN_FIELD_REF_SIZE);
+        } else {
+            print_hex((char*)value, len - BTR_EXTERN_FIELD_REF_SIZE);
+        }
+
+        while (len_sum < extern_len && page_no != FIL_NULL && page_no != 0) {
+            byte* blob_header;
+            ulint part_len;
+            
+            fprintf(stderr, "DEBUG: Processing BLOB page %lu, offset %lu\n", page_no, offset);
+
+            if (external_in_ibdata) {
+                if (fn == -1) {
+                    fn = open(path_ibdata, O_RDONLY);
+                    if (fn == -1) {
+                        fprintf(stderr, "-- Error: Cannot open %s\n", path_ibdata);
+                        perror("-- print_field_value_with_external(): open()");
+                        blob_error = 1;
+                        break;
                     }
-                    lseek(fn, page_no * UNIV_PAGE_SIZE, SEEK_SET);
-                } else {
-                    fn = open(tmp, O_RDONLY);
-                    }
-               if (fn != -1) {
-                   ssize_t nread = read(fn, page, UNIV_PAGE_SIZE);
-                   if (nread != UNIV_PAGE_SIZE)
-                       break;
-
-                   if (offset > UNIV_PAGE_SIZE)
-                       break;
-
-                   blob_header = page + offset;
-                   part_len = mach_read_from_4(blob_header + 0 /*BTR_BLOB_HDR_PART_LEN*/);
-                   if (part_len > UNIV_PAGE_SIZE)
-                       break;
-                   len_sum += part_len;
-                   page_no = mach_read_from_4(blob_header + 4 /*BTR_BLOB_HDR_NEXT_PAGE_NO*/);
-                   offset = FIL_PAGE_DATA;
-
-                   if (field->type == FT_TEXT && !hex) {
-                       print_string_raw((char*)blob_header + 8 /*BTR_BLOB_HDR_SIZE*/, part_len);
-                   } else {
-                       print_hex((char*)blob_header + 8 /*BTR_BLOB_HDR_SIZE*/, part_len);
-                   }
-
-                   if(!external_in_ibdata) close(fn);
-
-                   if (page_no == FIL_NULL || page_no == 0)
-                       break;
-
-                   if (len_sum >= extern_len)
-                       break;
-               } else {
-                    fprintf(stderr, "-- #####CannotOpen_%s;\n", tmp);
-                    perror("-- print_field_value_with_external(): open()");
+                }
+                if (lseek(fn, page_no * UNIV_PAGE_SIZE, SEEK_SET) == -1) {
+                    fprintf(stderr, "-- Error: Cannot seek in %s\n", path_ibdata);
+                    perror("-- print_field_value_with_external(): lseek()");
+                    blob_error = 1;
                     break;
-               }
-           }
-           if (field->type == FT_TEXT) {
-               fprintf(f_result, "\"");
-           }
+                }
+            } else {
+                snprintf(tmp, sizeof(tmp), "%s/%016lu.page", blob_dir, page_no);
+                fn = open(tmp, O_RDONLY);
+                if (fn == -1) {
+                    fprintf(stderr, "-- Warning: Cannot open BLOB page %s\n", tmp);
+                    perror("-- print_field_value_with_external(): open()");
+                    blob_error = 1;
+                    break;
+                }
+            }
 
-           break;
+            ssize_t nread = read(fn, page, UNIV_PAGE_SIZE);
+            if (nread != UNIV_PAGE_SIZE) {
+                fprintf(stderr, "-- Error: Cannot read full page from BLOB file (read %zd bytes)\n", nread);
+                blob_error = 1;
+                break;
+            }
 
-       default:
-           fprintf(f_result, "error(%d)", field->type);
-   }
+            if (offset >= UNIV_PAGE_SIZE) {
+                fprintf(stderr, "-- Error: Invalid offset %lu in BLOB page (page size: %d)\n", offset, UNIV_PAGE_SIZE);
+                // Try to recover by resetting offset to the start of the page
+                offset = FIL_PAGE_DATA;
+                fprintf(stderr, "-- Attempting to recover by resetting offset to %d\n", FIL_PAGE_DATA);
+            }
+
+            blob_header = page + offset;
+            part_len = mach_read_from_4(blob_header + 0 /*BTR_BLOB_HDR_PART_LEN*/);
+            fprintf(stderr, "DEBUG: BLOB part length: %lu\n", part_len);
+
+            if (part_len > UNIV_PAGE_SIZE - offset) {
+                fprintf(stderr, "-- Error: Invalid part length %lu in BLOB page (remaining page size: %lu)\n", 
+                        part_len, UNIV_PAGE_SIZE - offset);
+                // Try to recover by using the remaining page size
+                part_len = UNIV_PAGE_SIZE - offset - 8/*BTR_BLOB_HDR_SIZE*/;
+                fprintf(stderr, "-- Attempting to recover by using length: %lu\n", part_len);
+            }
+
+            if (part_len > 0) {
+                len_sum += part_len;
+                
+                if (field->type == FT_TEXT && !hex) {
+                    print_string_raw((char*)blob_header + 8/*BTR_BLOB_HDR_SIZE*/, part_len);
+                } else {
+                    print_hex((char*)blob_header + 8/*BTR_BLOB_HDR_SIZE*/, part_len);
+                }
+            } else {
+                fprintf(stderr, "-- Warning: Zero or negative part length, skipping this part\n");
+            }
+
+            page_no = mach_read_from_4(blob_header + 4/*BTR_BLOB_HDR_NEXT_PAGE_NO*/);
+            fprintf(stderr, "DEBUG: Next BLOB page: %lu\n", page_no);
+            offset = FIL_PAGE_DATA;
+
+            if (!external_in_ibdata) {
+                close(fn);
+                fn = -1;
+            }
+        }
+
+        if (blob_error) {
+            fprintf(f_result, "<BLOB_DATA_ERROR>");
+        }
+
+        if (field->type == FT_TEXT && !hex) {
+            fprintf(f_result, "\"");
+        }
+        break;
+
+    default:
+        fprintf(f_result, "<UNKNOWN_FIELD_TYPE:%d>", field->type);
+    }
+
+    if (fn != -1 && !external_in_ibdata) {
+        close(fn);
+    }
 }
-
 /*******************************************************************/
 void
 rec_print_new(

@@ -7,3 +7,4 @@ lex.yy.c
 sql_parser.c
 stream_parser
 .DS_Store
+.vscode

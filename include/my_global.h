@@ -796,7 +796,7 @@ typedef SOCKET_SIZE_TYPE size_socket;
 /* isinf() can be used in both C and C++ code */
 #define my_isinf(X) isinf(X)
 #else
-#define my_isinf(X) (!finite(X) && !isnan(X))
+#define my_isinf(X) (!isfinite(X) && !isnan(X))
 #endif
 
 /* Define missing math constants. */

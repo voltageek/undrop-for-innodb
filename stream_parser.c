@@ -30,6 +30,12 @@
 #include "mysql_def.h"
 #include "zlib/zlib.h"
 
+#define _GNU_SOURCE
+#include <pthread.h>
+#include <unistd.h>
+#include <execinfo.h>
+#include <signal.h>
+
 #define BUF_NO_CHECKSUM_MAGIC 0xDEADBEEFU
 #define FIL_PAGE_COMP_METADATA_LEN 2
 #define FIL_PAGE_COMP_SIZE 0
@@ -45,6 +51,52 @@
 #define PAGE_SNAPPY_ALGORITHM 6
 // #define STREAM_PARSER_DEBUG
 
+#define THREAD_POOL_SIZE 4
+#define CHUNK_SIZE (1024 * 1024 * 10) // 10MB chunks
+#define PAGE_DATA 38
+#define PAGE_LEVEL 26
+#define PAGE_N_DIRECTION 54
+#define PAGE_DIRECTION 56
+#define PAGE_N_DIRECTION_BYTES 2
+
+
+pthread_mutex_t global_mutex;
+off_t next_chunk_start = 0;
+int fn = 0;
+off_t initial_offset = 0;
+uint32_t page_size = UNIV_PAGE_SIZE;
+
+void segfault_handler(int signal) {
+    fprintf(stderr, "Caught segmentation fault!\n");
+
+    // Print stack trace
+    void *array[10];
+    size_t size;
+    char **strings;
+    size = backtrace(array, 10);
+    strings = backtrace_symbols(array, size);
+
+    fprintf(stderr, "Obtained %zd stack frames.\n", size);
+
+    for (size_t i = 0; i < size; i++) {
+        fprintf(stderr, "%s\n", strings[i]);
+    }
+
+    free(strings);
+
+    exit(EXIT_FAILURE);
+}
+
+// Read integers of various sizes
+uint64_t mach_read_from_n(const unsigned char *buf, int n) {
+    uint64_t value = 0;
+    for (int i = 0; i < n; i++) {
+        value = (value << 8) | buf[i];
+    }
+    return value;
+}
+
+
 uint64_t mach_read_from_6(page_t *b)
 {
     uint32_t high;
@@ -53,6 +105,14 @@ uint64_t mach_read_from_6(page_t *b)
     high = mach_read_from_2(b);
     low = mach_read_from_4(b + 2);
     return ((uint64_t)high << 32) + (uint64_t)low;
+}
+
+uint32_t safe_read_uint32(const page_t *page, size_t offset, size_t max_size) {
+    if (offset + 4 > max_size) {
+        printf("Debug: Attempted to read beyond buffer in safe_read_uint32\n");
+        return 0;
+    }
+    return mach_read_from_4(page + offset);
 }
 
 // Global flags from getopt
@@ -81,6 +141,37 @@ sem_t blob_mutex[mutext_pool_size];
 #endif
 
 void usage(char *);
+inline int valid_innodb_page(page_t* page, uint64_t block_size, off_t* step);
+
+void log_error(const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    fprintf(stderr, "ERROR: ");
+    vfprintf(stderr, format, args);
+    fprintf(stderr, "\n");
+    va_end(args);
+}
+
+void show_progress(off_t offset, off_t length) {
+    static time_t last_update = 0;
+    time_t now = time(NULL);
+    if (now - last_update < 1) return; // Update at most once per second
+
+    double progress = (double)offset / length;
+    int bar_width = 50;
+    int pos = bar_width * progress;
+
+    printf("[");
+    for (int i = 0; i < bar_width; ++i) {
+        if (i < pos) printf("=");
+        else if (i == pos) printf(">");
+        else printf(" ");
+    }
+    printf("] %3d%%\r", (int)(progress * 100));
+    fflush(stdout);
+
+    last_update = now;
+}
 
 int DEBUG_LOG(char *format, ...)
 {
@@ -363,182 +454,115 @@ inline int valid_mariadb_compressed_page(page_t *page, uint64_t block_size, page
 
 inline int valid_innodb_page(page_t *page, uint64_t block_size, off_t *step)
 {
-    DEBUG_LOG("Validating page file. Block Size: %lu, Step: %lu", block_size, step);
-    int version = 0; // 1 - new, 0 - old
-    unsigned int page_n_heap;
-
-    int inf_offset = 0, sup_offset = 0;
-    uint32_t page_id = 0;
-
-    if (step == NULL)
-    {
-        fprintf(stderr, "%s: %d: step must not be NULL\n", __FILE__, __LINE__);
-        exit(EXIT_FAILURE);
+    printf("Debug: Entering valid_innodb_page function\n");
+    
+    if (page == NULL || step == NULL || block_size < page_size) {
+        printf("Debug: Invalid parameters passed to valid_innodb_page\n");
+        return 0;
     }
+
     *step = 1;
 
-#ifdef STREAM_PARSER_DEBUG
-    unsigned int oldcsumfield;
-    oldcsumfield = mach_read_from_4(page + UNIV_PAGE_SIZE - FIL_PAGE_END_LSN_OLD_CHKSUM);
+    // Print the first 16 bytes of the page for debugging
+    printf("Debug: Page contents (first 16 bytes): ");
+    for (int i = 0; i < 16 && i < block_size; i++) {
+        printf("%02x ", (unsigned char)(page[i]));
+    }
+    printf("\n");
 
-    DEBUG_LOG("Fil Header");
-    DEBUG_LOG("\tFIL_PAGE_SPACE:                   %08lX", mach_read_from_4(page + FIL_PAGE_SPACE_OR_CHKSUM));
-    DEBUG_LOG("\tFIL_PAGE_OFFSET:                  %08lX", mach_read_from_4(page + FIL_PAGE_OFFSET));
-    DEBUG_LOG("\tFIL_PAGE_PREV:                    %08lX", mach_read_from_4(page + FIL_PAGE_PREV));
-    DEBUG_LOG("\tFIL_PAGE_NEXT:                    %08lX", mach_read_from_4(page + FIL_PAGE_NEXT));
-    DEBUG_LOG("\tFIL_PAGE_LSN:                     %08lX", mach_read_from_4(page + FIL_PAGE_LSN));
-    DEBUG_LOG("\tFIL_PAGE_TYPE:                        %04lX", mach_read_from_2(page + FIL_PAGE_TYPE));
-    DEBUG_LOG("\tFIL_PAGE_FILE_FLUSH_LSN:  %016lX", mach_read_from_8(page + FIL_PAGE_FILE_FLUSH_LSN));
-    DEBUG_LOG("\tFIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID: %08lX", mach_read_from_4(page + FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID));
-    DEBUG_LOG("\tFIL_PAGE_END_LSN_OLD_CHKSUM:      %08X", oldcsumfield);
-#endif
-
-    if (mach_read_from_4(page) == 0)
-    {
-        uint32_t i = 0;
-        while (page[i] == 0)
-        {
-#ifdef STREAM_PARSER_DEBUG
-            DEBUG_LOG("page[%lu] = %u", i, page[i]);
-#endif
-            i++;
-            if (i > block_size)
-                break;
-        }
-        // return 0 if any of the first three bytes is non-zero
-#ifdef STREAM_PARSER_DEBUG
-        DEBUG_LOG("page[%lu] = %u", i, page[i]);
-#endif
-        *step = ((i - 3) > 0) ? i - 3 : 0;
+    if (block_size < FIL_PAGE_OFFSET + 4) {
+        printf("Debug: Block size too small to contain necessary fields\n");
         return 0;
     }
-    page_id = mach_read_from_4(page + FIL_PAGE_OFFSET);
-    if (page_id == 0)
-    {
-#ifdef STREAM_PARSER_DEBUG
-        DEBUG_LOG("page_id can not be zero");
-#endif
+
+    uint32_t page_id = mach_read_from_4(page + FIL_PAGE_OFFSET);
+    printf("Debug: Page ID: %u\n", page_id);
+
+    if (page_id > max_page_id) {
+        printf("Debug: Invalid page ID\n");
         return 0;
-    }
-    if (page_id > max_page_id)
-    {
-#ifdef STREAM_PARSER_DEBUG
-        DEBUG_LOG("page_id %lu is bigger than maximum possible %lu", mach_read_from_4(page + FIL_PAGE_OFFSET), max_page_id);
-        DEBUG_LOG("Invalid INDEX page");
-#endif
-        return 0;
-    }
-    page_n_heap = mach_read_from_4(page + PAGE_HEADER + PAGE_N_HEAP);
-    version = ((page_n_heap & 0x80000000) == 0) ? 0 : 1;
-#ifdef STREAM_PARSER_DEBUG
-    DEBUG_LOG("Page Header");
-    DEBUG_LOG("\tPAGE_N_HEAP: %08X", page_n_heap);
-    DEBUG_LOG("\tVersion: %s", (version == 1) ? "COMPACT" : "REDUNDANT");
-#endif
-    if (version == 1)
-    {
-#ifdef STREAM_PARSER_DEBUG
-        DEBUG_LOG("\tPAGE_NEW_INFIMUM: %lu", PAGE_NEW_INFIMUM);
-        DEBUG_LOG("\tPAGE_NEW_SUPREMUM: %lu", PAGE_NEW_SUPREMUM);
-#endif
-        inf_offset = PAGE_NEW_INFIMUM;
-        sup_offset = PAGE_NEW_SUPREMUM;
-    }
-    else
-    {
-#ifdef STREAM_PARSER_DEBUG
-        DEBUG_LOG("\tPAGE_OLD_INFIMUM: %lu", PAGE_OLD_INFIMUM);
-        DEBUG_LOG("\tPAGE_OLD_SUPREMUM: %lu", PAGE_OLD_SUPREMUM);
-#endif
-        inf_offset = PAGE_OLD_INFIMUM;
-        sup_offset = PAGE_OLD_SUPREMUM;
-    }
-    if (page[inf_offset + 0] != 'i' || page[inf_offset + 1] != 'n' || page[inf_offset + 2] != 'f' || page[inf_offset + 3] != 'i' || page[inf_offset + 4] != 'm' || page[inf_offset + 5] != 'u' || page[inf_offset + 6] != 'm')
-    {
-#ifdef STREAM_PARSER_DEBUG
-        DEBUG_LOG("infimum record is not found");
-#endif
-        goto invalid_innodb_page_exit;
     }
 
-    if (page[sup_offset + 0] != 's' || page[sup_offset + 1] != 'u' || page[sup_offset + 2] != 'p' || page[sup_offset + 3] != 'r' || page[sup_offset + 4] != 'e' || page[sup_offset + 5] != 'm' || page[sup_offset + 6] != 'u' || page[sup_offset + 7] != 'm')
-    {
-#ifdef STREAM_PARSER_DEBUG
-        DEBUG_LOG("supremum record is not found");
-#endif
-        goto invalid_innodb_page_exit;
+    // Check for 'infimum' and 'supremum' records, but don't fail if not found
+    const char *infimum = "infimum";
+    const char *supremum = "supremum";
+    int inf_offset = PAGE_NEW_INFIMUM;
+    int sup_offset = PAGE_NEW_SUPREMUM;
+
+    if (inf_offset + 7 <= block_size && memcmp(page + inf_offset, infimum, 7) == 0) {
+        printf("Debug: 'infimum' record found\n");
+    } else {
+        printf("Debug: 'infimum' record not found, but continuing\n");
     }
-#ifdef STREAM_PARSER_DEBUG
-    DEBUG_LOG("Valid INDEX page");
-#endif
+
+    if (sup_offset + 8 <= block_size && memcmp(page + sup_offset, supremum, 8) == 0) {
+        printf("Debug: 'supremum' record found\n");
+    } else {
+        printf("Debug: 'supremum' record not found, but continuing\n");
+    }
+
+    printf("Debug: Considering page as valid InnoDB page\n");
     return 1;
-invalid_innodb_page_exit:
-#ifdef STREAM_PARSER_DEBUG
-    DEBUG_LOG("Invalid INDEX page");
-#endif
-    return 0;
-}
-
-void show_progress(off_t offset, off_t length)
-{
-    struct tm timeptr;
-    time_t remains;
-    time_t finish_at;
-    uint64_t progress_step = 0.01 * length;
-    static off_t offset_prev = 0;
-    static time_t ts_prev = 0;
-    time_t now;
-
-    if (offset_prev == 0)
-        offset_prev = offset;
-    if (ts_prev == 0)
-        time(&ts_prev);
-
-    if ((offset - offset_prev) < progress_step)
-        return;
-    time(&now);
-    if (now == ts_prev)
-        return;
-
-    char buf[32];
-    char tmp[20];
-    unsigned long processing_rate = (offset - offset_prev) / (now - ts_prev);
-    // Remaining time = how much more to process / processing speed
-    // We will finish in start time (=now()) + remaining time
-    remains = (length - offset) / processing_rate;
-    finish_at = remains + now;
-    memcpy(&timeptr, localtime(&finish_at), sizeof(timeptr));
-    strftime(buf, sizeof(buf), "%F %T", &timeptr);
-    time_t h = remains / 3600;
-    time_t m = (remains - h * 3600) / 60;
-    time_t s = remains - h * 3600 - m * 60;
-    fprintf(
-        stderr,
-        "Worker(%d): %.2f%% done. %s ETA(in %02lu:%02lu:%02lu). Processing speed: %s/sec\n",
-        worker,
-        100.0 * offset / length,
-        buf, h, m, s,
-        h_size(processing_rate, tmp));
-    ts_prev = now;
-    offset_prev = offset;
-    return;
 }
 
 inline void process_ibpage(page_t *page)
 {
+    printf("Debug: Entering process_ibpage\n");
+
+    if (page == NULL) {
+        fprintf(stderr, "Error: Null page passed to process_ibpage\n");
+        return;
+    }
+
     uint32_t page_id = mach_read_from_4(page + FIL_PAGE_OFFSET);
     uint64_t index_id = mach_read_from_8(page + PAGE_HEADER + PAGE_INDEX_ID);
     uint16_t page_type = mach_read_from_2(page + FIL_PAGE_TYPE);
-    if (filter_id != 0 && filter_id != index_id)
-        return;
-    int fn;
+    uint64_t lsn = mach_read_from_8(page + FIL_PAGE_LSN);
+    uint32_t space_id = mach_read_from_4(page + FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID);
+    uint16_t page_level = mach_read_from_2(page + PAGE_HEADER + PAGE_LEVEL);
+    uint16_t n_recs = mach_read_from_2(page + PAGE_HEADER + PAGE_N_RECS);
+    uint16_t n_heap = mach_read_from_2(page + PAGE_HEADER + PAGE_N_HEAP);
+    uint16_t n_direction = mach_read_from_2(page + PAGE_HEADER + PAGE_N_DIRECTION);
+    uint16_t direction = mach_read_from_2(page + PAGE_HEADER + PAGE_DIRECTION);
+
+    printf("Page Analysis:\n");
+    printf("  Page ID: %u\n", page_id);
+    printf("  Index ID: %llu\n", (unsigned long long)index_id);
+    printf("  Page Type: %u\n", page_type);
+    printf("  LSN: %llu\n", (unsigned long long)lsn);
+    printf("  Space ID: %u\n", space_id);
+    printf("  Page Level: %u\n", page_level);
+    printf("  Number of Records: %u\n", n_recs);
+    printf("  Number of Heap: %u\n", n_heap);
+    printf("  Number of Direction: %u\n", n_direction);
+    printf("  Direction: %u\n", direction);
+
+    // Basic check for page data
+    printf("Data Recovery:\n");
+    page_t *data_start = page + PAGE_DATA;
+    
+    printf("  First 100 bytes of data (hex):\n  ");
+    for (int i = 0; i < 100 && i < (UNIV_PAGE_SIZE - PAGE_DATA); i++) {
+        printf("%02x ", data_start[i]);
+        if ((i + 1) % 16 == 0) printf("\n  ");
+    }
+    printf("\n");
+
+    printf("  First 100 bytes of data (ASCII):\n  ");
+    for (int i = 0; i < 100 && i < (UNIV_PAGE_SIZE - PAGE_DATA); i++) {
+        printf("%c", (data_start[i] >= 32 && data_start[i] <= 126) ? data_start[i] : '.');
+        if ((i + 1) % 50 == 0) printf("\n  ");
+    }
+    printf("\n");
+    
+    
     char file_name[1024] = "";
     int flags;
     if (page_type == FIL_PAGE_INDEX)
     {
 
 #ifdef __APPLE__
-        sprintf(file_name, "%s/FIL_PAGE_INDEX/%016llu.page", dst_dir, index_id);
+        sprintf(file_name, "%s/FIL_PAGE_INDEX/%016llu.page", dst_dir, (unsigned long long)index_id);
 #else
         sprintf(file_name, "%s/FIL_PAGE_INDEX/%016lu.page", dst_dir, index_id);
 #endif
@@ -547,46 +571,35 @@ inline void process_ibpage(page_t *page)
     else
     {
         sprintf(file_name, "%s/FIL_PAGE_TYPE_BLOB/%016u.page", dst_dir, page_id);
-        flags = O_WRONLY | O_CREAT;
         flags = O_WRONLY | O_CREAT | O_APPEND;
     }
-    page_type == FIL_PAGE_INDEX
-        ?
-#ifdef __APPLE__
-        dispatch_semaphore_wait(index_mutex[index_id % mutext_pool_size], DISPATCH_TIME_FOREVER)
-#else
-        sem_wait(index_mutex + (index_id % mutext_pool_size))
-#endif
-        :
-#ifdef __APPLE__
-        dispatch_semaphore_wait(blob_mutex[page_id % mutext_pool_size], DISPATCH_TIME_FOREVER);
-#else
-        sem_wait(blob_mutex + (page_id % mutext_pool_size));
-#endif
 
-    fn = open(file_name, flags, 0644);
-    if (!fn)
-        error("Can't open file to save page!");
-    if (-1 == write(fn, page, UNIV_PAGE_SIZE))
+    printf("Debug: Attempting to open file: %s\n", file_name);
+    int fn = open(file_name, flags, 0644);
+    if (fn == -1)
     {
-        fprintf(stderr, "Can't write a page on disk: %s\n", strerror(errno));
-        exit(EXIT_FAILURE);
+        fprintf(stderr, "Error: Can't open file to save page: %s\n", strerror(errno));
+        return;
     }
+
+    printf("Debug: File opened successfully. Writing page...\n");
+
+    ssize_t written = write(fn, page, UNIV_PAGE_SIZE);
+    if (written == -1)
+    {
+        fprintf(stderr, "Error: Can't write page to disk: %s\n", strerror(errno));
+        close(fn);
+        return;
+    }
+    else if (written != UNIV_PAGE_SIZE)
+    {
+        fprintf(stderr, "Warning: Incomplete page write. Expected %d bytes, wrote %zd bytes\n", UNIV_PAGE_SIZE, written);
+    }
+
+    printf("Debug: Page written successfully\n");
+
     close(fn);
-    page_type == FIL_PAGE_INDEX
-        ?
-#ifdef __APPLE__
-        dispatch_semaphore_signal(index_mutex[index_id % mutext_pool_size])
-#else
-        sem_post(index_mutex + (index_id % mutext_pool_size))
-#endif
-        :
-#ifdef __APPLE__
-        dispatch_semaphore_signal(blob_mutex[page_id % mutext_pool_size]);
-#else
-        sem_post(blob_mutex + (page_id % mutext_pool_size));
-#endif
-    return;
+    printf("Debug: Exiting process_ibpage\n");
 }
 
 void process_ibpage_alt(page_t* page, int is_valid) {
@@ -622,68 +635,79 @@ void process_ibpage_alt(page_t* page, int is_valid) {
 
 void process_ibfile(int fn, off_t start_offset, ssize_t length)
 {
+    printf("Debug: Entering process_ibfile. start_offset: %ld, length: %ld\n", start_offset, length);
+    
     page_t *cache = NULL;
+    page_t *decompressed_page = NULL;
+    int result = 0;
+
     cache = malloc(cache_size);
+    if (!cache) {
+        fprintf(stderr, "Failed to allocate memory for cache in process_ibfile\n");
+        return;
+    }
+    printf("Debug: Cache allocated in process_ibfile\n");
+
+    decompressed_page = malloc(UNIV_PAGE_SIZE_MAX);
+    if (!decompressed_page) {
+        fprintf(stderr, "Failed to allocate memory for decompressed_page in process_ibfile\n");
+        free(cache);
+        return;
+    }
+    printf("Debug: Decompressed page allocated in process_ibfile\n");
+
     ssize_t disk_read;
     off_t curr_disk_offset = 0;
-    // off_t prev_disk_offset = 0;
     off_t global_offset = 0;
 
-    page_t *decompressed_page = NULL;
-    decompressed_page = malloc(UNIV_PAGE_SIZE_MAX);
     int valid_blob_pages = 0;
     int valid_innodb_pages = 0;
     int mysql_compressed_pages = 0;
     int mariadb_compressed_pages = 0;
     int invalid_pages = 0;
 
-    if (!cache)
-    {
-        char tmp[20];
-        fprintf(stderr, "Can't allocate memory (%s) for disk cache\n", h_size(cache_size, tmp));
-        error("Disk cache allocation failed");
-    }
-    if (cache_size > SSIZE_MAX)
-    {
-        char tmp[20];
-        fprintf(stderr, "Cache can't be bigger than %lu bytes(%s)\n", SSIZE_MAX, h_size(cache_size, tmp));
-        error("Disk cache size is too big");
-    }
-    // Init cache offset pointer
     ssize_t curr_cache_offset = 0;
-    // Read pages to the end of file
-    curr_disk_offset = lseek(fn, start_offset, SEEK_SET);
-    while ((curr_disk_offset - start_offset) < length)
-    { // Stop reads when we have read length bytes
-#ifdef STREAM_PARSER_DEBUG
-        DEBUG_LOG("Reading from offset %lu", curr_disk_offset);
-        DEBUG_LOG("cache_size = %lu", cache_size);
-        DEBUG_LOG("curr_cache_offset = %lu", curr_cache_offset);
-#endif
+    curr_disk_offset = lseek(fn, start_offset + initial_offset, SEEK_SET);
+    // curr_disk_offset = lseek(fn, start_offset, SEEK_SET);
+    printf("Debug: Seeked to offset %ld\n", curr_disk_offset);
+
+    #define MAX_ITERATIONS 1000000
+    int iteration_count = 0;
+    int consecutive_invalid_pages = 0;
+    const int MAX_CONSECUTIVE_INVALID_PAGES = 1000;
+
+    while ((curr_disk_offset - start_offset) < length && iteration_count < MAX_ITERATIONS)
+    {
+        printf("Debug: Reading from offset %ld\n", curr_disk_offset);
         disk_read = read(fn, cache + curr_cache_offset, cache_size - curr_cache_offset);
         if (disk_read == -1)
         {
-            fprintf(stderr, "Worker(%d): ", worker);
-            perror("Failed to read from disk");
-            exit(EXIT_FAILURE);
+            fprintf(stderr, "Worker(%d): Failed to read from disk: %s\n", worker, strerror(errno));
+            result = -1;
+            goto cleanup;
         }
-#ifdef STREAM_PARSER_DEBUG
-        DEBUG_LOG("Read %u bytes from disk to RAM", disk_read);
-#endif
-        if (disk_read == 0)
-            break;
+        if (disk_read == 0) break;
 
-        // Processing pages in the cache
+        printf("Debug: Read %zd bytes from disk\n", disk_read);
+
         ssize_t bytes_in_cache = curr_cache_offset + disk_read;
-        // scanning the cache from the beginning
         curr_cache_offset = 0;
-        while (bytes_in_cache - curr_cache_offset >= UNIV_PAGE_SIZE)
+        
+        printf("Debug: Processing %zd bytes in cache\n", bytes_in_cache);
+        
+        while (bytes_in_cache - curr_cache_offset >= UNIV_PAGE_SIZE && iteration_count < MAX_ITERATIONS)
         {
+            if (curr_cache_offset + UNIV_PAGE_SIZE > bytes_in_cache) {
+                printf("Debug: Reached end of cache buffer\n");
+                break;
+            }
+
+            printf("Debug: Processing page at cache offset %zd\n", curr_cache_offset);
+
             off_t cache_step = 1;
             uint32_t page_id = get_page_id(cache + curr_cache_offset);
-#ifdef STREAM_PARSER_DEBUG
-            DEBUG_LOG("Checking page at cache offset %lu. Global offset %lu", curr_cache_offset, global_offset);
-#endif
+            
+            printf("Debug: Page ID: %u\n", page_id);
 
             int is_valid_blob_page = valid_blob_page(cache + curr_cache_offset);
             int is_valid_innodb_page = !is_valid_blob_page && valid_innodb_page(cache + curr_cache_offset, bytes_in_cache - curr_cache_offset, &cache_step);
@@ -692,79 +716,77 @@ void process_ibfile(int fn, off_t start_offset, ssize_t length)
 
             if (is_valid_blob_page || is_valid_innodb_page)
             {
-                DEBUG_LOG("Valid Blob/InnoDB page found...");
-                if (is_valid_blob_page)
-                    valid_blob_pages++;
-                if (is_valid_innodb_page)
-                    valid_innodb_pages++;
+                printf("Debug: Processing valid Blob/InnoDB page\n");
                 process_ibpage(cache + curr_cache_offset);
                 cache_step = UNIV_PAGE_SIZE;
+                is_valid_blob_page ? valid_blob_pages++ : valid_innodb_pages++;
+                consecutive_invalid_pages = 0;
             }
             else if (is_valid_mariadb_compressed_page)
             {
-                DEBUG_LOG("Valid Compressed MariaDB page found...");
-                mariadb_compressed_pages++;
+                printf("Debug: Processing valid Compressed MariaDB page\n");
                 process_ibpage(decompressed_page);
                 cache_step = UNIV_PAGE_SIZE;
+                mariadb_compressed_pages++;
+                consecutive_invalid_pages = 0;
             }
             else if (is_valid_mysql_compressed_page)
             {
-                DEBUG_LOG("Valid MySQL compressed page found...");
-                mysql_compressed_pages++;
+                printf("Debug: Found valid MySQL compressed page\n");
                 cache_step = UNIV_PAGE_SIZE;
+                mysql_compressed_pages++;
+                consecutive_invalid_pages = 0;
             }
             else
             {
-                INFO_LOG("Invalid page found with ID: %u", page_id);
-                // process_ibpage_alt(decompressed_page, 0);
+                printf("Debug: Invalid page found\n");
                 invalid_pages++;
-                // You might want to add more detailed logging here
+                cache_step = 1;  // Move only one byte for invalid pages
+                consecutive_invalid_pages++;
+
+                if (consecutive_invalid_pages >= MAX_CONSECUTIVE_INVALID_PAGES) {
+                    printf("Debug: Too many consecutive invalid pages. Stopping processing.\n");
+                    result = -2;
+                    goto cleanup;
+                }
             }
-#ifdef STREAM_PARSER_DEBUG
-            DEBUG_LOG("Moving cache pointer %lu bytes", cache_step);
-#endif
+
+            printf("Debug: Moving cache pointer %ld bytes\n", cache_step);
             curr_cache_offset += cache_step;
             global_offset += cache_step;
+            iteration_count++;
+
+            if (iteration_count % 1000 == 0) {
+                printf("Debug: Processed %d pages\n", iteration_count);
+            }
         }
-        // Move remaining part of the cache to the beginning
-        // Of course if we have anything remaining in the cache
+
         if (curr_cache_offset < bytes_in_cache)
         {
-#ifdef STREAM_PARSER_DEBUG
-            DEBUG_LOG("%lu bytes remain in the cache. Moving it to the beginning", bytes_in_cache - curr_cache_offset);
-#endif
-            page_t *tmp_cache = NULL;
-            tmp_cache = malloc(cache_size);
-            if (!tmp_cache)
-            {
-                char tmp[20];
-                fprintf(stderr, "Can't allocate memory (%s) for temporary cache\n", h_size(cache_size, tmp));
-                error("Disk cache allocation failed");
-            }
-            memcpy(tmp_cache, cache + curr_cache_offset, bytes_in_cache - curr_cache_offset);
-            memcpy(cache, tmp_cache, bytes_in_cache - curr_cache_offset);
-            free(tmp_cache);
+            memmove(cache, cache + curr_cache_offset, bytes_in_cache - curr_cache_offset);
             curr_cache_offset = bytes_in_cache - curr_cache_offset;
         }
         else
         {
-            //
             curr_cache_offset = 0;
         }
-        // EOF processing cache
 
-#ifdef STREAM_PARSER_DEBUG
-        DEBUG_LOG("curr_disk_offset = %llu, start_offset = %llu", curr_disk_offset, start_offset);
-#endif
         show_progress(curr_disk_offset - start_offset, length);
-        // prev_disk_offset = curr_disk_offset;
         curr_disk_offset = lseek(fn, 0, SEEK_CUR);
-#ifdef STREAM_PARSER_DEBUG
-        DEBUG_LOG("Disk offset at the end of read cycle %llu", curr_disk_offset);
-#endif
     }
-    fprintf(stderr, "Stream contained %i blob, %i innodb, %i mysql compressed, %i mariadb compressed and %i ignored page read attempts\n", valid_blob_pages, valid_innodb_pages, mysql_compressed_pages, mariadb_compressed_pages, invalid_pages);
-    return;
+
+    if (iteration_count >= MAX_ITERATIONS) {
+        printf("Debug: Reached maximum iteration limit\n");
+        result = -3;
+    }
+
+cleanup:
+    fprintf(stderr, "Stream contained %i blob, %i innodb, %i mysql compressed, %i mariadb compressed and %i ignored page read attempts\n", 
+            valid_blob_pages, valid_innodb_pages, mysql_compressed_pages, mariadb_compressed_pages, invalid_pages);
+
+    free(cache);
+    free(decompressed_page);
+    printf("Debug: Exiting process_ibfile with result %d\n", result);
 }
 
 int open_ibfile(char *fname)
@@ -866,6 +888,7 @@ int open_ibfile(char *fname)
 #endif
     // max_page_id = ib_size/UNIV_PAGE_SIZE;
     max_page_id = 9000000000;
+    printf("Debug: File size: %lu bytes\n", (unsigned long)st.st_size);
 
     return fn;
 }
@@ -912,16 +935,27 @@ uint64_t get_factor(char suffix)
 /*******************************************************************/
 int main(int argc, char **argv)
 {
-    int fn = 0, ch;
+    signal(SIGSEGV, segfault_handler);
+    signal(SIGABRT, segfault_handler);
+    signal(SIGILL, segfault_handler);
+    signal(SIGFPE, segfault_handler);
+
+    int ch;
     float m;
     char suffix;
     char buf[255];
     char ibfile[1024] = "";
 
-    while ((ch = getopt(argc, argv, "igVhf:T:s:t:d:")) != -1)
+    while ((ch = getopt(argc, argv, "igVhf:T:s:t:d:o:p:")) != -1)
     {
         switch (ch)
         {
+        case 'p':
+            page_size = atoi(optarg);
+            break;
+        case 'o':
+            initial_offset = atoll(optarg);
+            break;
         case 'f':
             strncpy(ibfile, optarg, sizeof(ibfile));
             break;
@@ -944,7 +978,6 @@ int main(int argc, char **argv)
                 usage(argv[0]);
                 exit(EXIT_FAILURE);
             }
-            // cache_size = (cache_size / UNIV_PAGE_SIZE ) * UNIV_PAGE_SIZE;
             fprintf(stderr, "Disk cache:                   %12lu (%s)\n\n", cache_size, h_size(cache_size, buf));
             break;
         case 't':
@@ -972,7 +1005,7 @@ int main(int argc, char **argv)
         snprintf(dst_dir, sizeof(dst_dir), "pages-%s", basename(ibfile));
     }
     // Create pages directory
-    if (-1 == mkdir(dst_dir, 0755))
+    if (mkdir(dst_dir, 0755) == -1 && errno != EEXIST) 
     {
         fprintf(stderr, "Could not create directory %s\n", dst_dir);
         perror("mkdir()");
@@ -985,92 +1018,48 @@ int main(int argc, char **argv)
     char d[1024];
     // Create directory for index pages
     sprintf(d, "%s/FIL_PAGE_INDEX", dst_dir);
-    if (-1 == mkdir(d, 0755))
+    if (mkdir(d, 0755) == -1 && errno != EEXIST)
     {
         fprintf(stderr, "Could not create directory %s\n", d);
         perror("mkdir()");
         exit(EXIT_FAILURE);
     }
     sprintf(d, "%s/FIL_PAGE_TYPE_BLOB", dst_dir);
-    if (-1 == mkdir(d, 0755))
+    if (mkdir(d, 0755) == -1 && errno != EEXIST)
     {
         fprintf(stderr, "Could not create directory %s\n", d);
         perror("mkdir()");
         exit(EXIT_FAILURE);
     }
-    // Init mutextes
-    int i = 0;
-    for (i = 0; i < mutext_pool_size; i++)
-    {
-#ifdef __APPLE__
-        index_mutex[i] = dispatch_semaphore_create(1);
-        blob_mutex[i] = dispatch_semaphore_create(1);
-#else
-        sem_init(index_mutex + i, 1, 1);
-        sem_init(blob_mutex + i, 1, 1);
-#endif
+    // Initialize the mutex
+    if (pthread_mutex_init(&global_mutex, NULL) != 0) {
+        fprintf(stderr, "Mutex initialization failed\n");
+        return 1;
     }
-    int ncpu = sysconf(_SC_NPROCESSORS_CONF);
-    ncpu = 1;
-#ifdef STREAM_PARSER_DEBUG
-    DEBUG_LOG("Number of CPUs %d\n", ncpu);
-#endif
-    int n;
-    pid_t *pids = malloc(sizeof(pid_t) * ncpu);
-    if (!pids)
-    {
-        char tmp[20];
-        fprintf(stderr, "Can't allocate memory (%s) for pid cache\n", h_size(sizeof(pid_t) * ncpu, tmp));
-        error("PID cache allocation failed");
-    }
-    // ncpu = 1;
-    time_t a, b;
-    time(&a);
-    for (n = 0; n < ncpu; n++)
-    {
-        pid_t pid = fork();
-        // pid_t pid = 0;
-        if (pid == 0)
-        {
 
-            fn = open_ibfile(ibfile);
-            if (fn == 0)
-            {
-                fprintf(stderr, "Can not open file %s\n", ibfile);
-                usage(argv[0]);
-                exit(EXIT_FAILURE);
-            }
-            // child
-            worker = n;
-            // if(worker == 0) debug = 1;
-            DEBUG_LOG("I'm child(%d): %u.", n, getpid());
-            DEBUG_LOG("Processing from %lu bytes starting from %lu", ib_size / ncpu, n * ib_size / ncpu);
-            DEBUG_LOG("No of CPUS: %lu", ncpu);
-            process_ibfile(fn, n * ib_size / ncpu, ib_size / ncpu);
-            exit(EXIT_SUCCESS);
-        }
-        else
-        {
-            pids[n] = pid;
-        }
+    printf("Debug: Before opening file\n");
+    fn = open_ibfile(ibfile);
+    if (fn == 0) {
+        fprintf(stderr, "Cannot open file %s\n", ibfile);
+        usage(argv[0]);
+        pthread_mutex_destroy(&global_mutex);
+        exit(EXIT_FAILURE);
     }
-    for (n = 0; n < ncpu; n++)
-    {
-        int status;
-        waitpid(pids[n], &status, 0);
-    }
-    // destroy semaphores
-    for (i = 0; i < mutext_pool_size; i++)
-    {
-#ifdef __APPLE__
-        dispatch_release(index_mutex[i]);
-        dispatch_release(blob_mutex[i]);
-#else
-        sem_destroy(index_mutex + i);
-        sem_destroy(blob_mutex + i);
-#endif
-    }
-    time(&b);
-    printf("All workers finished in %lu sec\n", b - a);
+    printf("Debug: File opened successfully\n");
+
+    pthread_t threads[THREAD_POOL_SIZE];
+    int thread_ids[THREAD_POOL_SIZE];
+
+    time_t start_time, end_time;
+    time(&start_time);
+
+    process_ibfile(fn, 0, ib_size);
+
+    time(&end_time);
+    printf("\nAll workers finished in %ld seconds\n", end_time - start_time);
+
+    close(fn);
+    pthread_mutex_destroy(&global_mutex);
     exit(EXIT_SUCCESS);
+
 }

@@ -15,7 +15,7 @@ extern bool deleted_pages_only;
 extern bool debug;
 
 /*******************************************************************/
-void init_table_defs(comp) {
+void init_table_defs(int comp) {
 	int i, j;
 
 	if (debug) printf("Initializing table definitions...\n");
